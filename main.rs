@@ -95,13 +95,21 @@ fn main() -> Result<()> {
             Inode::Compact(cpt)
         };
 
+        let dirents = inode.parse_inode(
+            inode.data_layout()?,
+            &file[inode_start..],
+            &file,
+            &superblock,
+        );
+
         if !inode.is_dir() {
-            continue;
+            let xattrs = inode.get_xattrs(&file[inode_start..]);
+            println!("xattrs: {:?}", xattrs);
+
+            if xattrs.is_some() {
+                break;
+            }
         }
-
-        let dirents = inode.dirents(inode.data_layout()?, &file[inode_start..]);
-
-        println!("dirents: {dirents:#?}");
 
         for dirent in dirents {
             if dirent.name == "." || dirent.name == ".." {

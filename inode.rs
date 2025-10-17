@@ -3,6 +3,8 @@ use std::{
     usize,
 };
 
+use crate::sb::Superblock;
+
 const S_IFMT: u16 = 0o170000;
 const S_IFREG: u16 = 0o100000;
 const S_IFCHR: u16 = 0o020000;
@@ -71,6 +73,54 @@ impl TryFrom<u8> for InodeDataLayout {
             4 => Ok(InodeDataLayout::ChunkBased),
             _ => Err(std::io::ErrorKind::Other.into()),
         }
+    }
+}
+
+#[repr(C, packed)]
+pub struct XattrHeader {
+    pub name_filter: u32, /* bit value 1 indicates not-present */
+    pub shared_count: u8,
+    pub reserved2: [u8; 7],
+    pub shared_xattrs: [u8; 4], /* shared xattr id array */
+}
+
+impl Display for XattrHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name_filter = self.name_filter;
+        let shared_xattrs = self.shared_xattrs;
+
+        f.debug_struct("Xattrs")
+            .field("name_filter", &name_filter)
+            .field("shared_count", &self.shared_count)
+            .field("reserved2", &self.reserved2)
+            .field("shared_xattrs", &shared_xattrs)
+            .finish()
+    }
+}
+
+impl Debug for XattrHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+pub struct Xattrs<'a> {
+    pub header: XattrHeader,
+    pub data: &'a [u8],
+}
+
+impl<'a> Display for Xattrs<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Xattrs")
+            .field("header", &self.header)
+            .field("data", &self.data)
+            .finish()
+    }
+}
+
+impl<'a> Debug for Xattrs<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
     }
 }
 
@@ -192,19 +242,33 @@ impl Inode {
         }
     }
 
+    pub fn xattr_count(&self) -> u16 {
+        match self {
+            Inode::Compact(c) => c.xattr_icount,
+            Inode::Extended(e) => e.xattr_icount,
+        }
+    }
+
     pub fn xattrs<'a>(&self, inode_data: &'a [u8]) -> &'a [u8] {
+        // This works because the xattrs are literally after the inode header
+        // The inline inode data is after the xattrs
+
+        //                             |-> aligned with 8B
+        //                                     |-> followed closely
+        // + meta_blkaddr blocks                                      |-> another slot
+        // _____________________________________________________________________
+        // |  ...   | inode |  xattrs  | extents  | data inline | ... | inode ...
+        // |________|_______|(optional)|(optional)|__(optional)_|_____|__________
+
         match self {
             Inode::Compact(compact) if compact.xattr_icount > 0 => {
                 let size = (compact.xattr_icount as usize - 1) * 4 + 12;
-                println!("extended attr size: {size}");
-
                 // WE skip the header bit from the data and take the rest
                 &inode_data[std::mem::size_of::<CompactInodeHeader>()..][..size]
             }
 
             Inode::Extended(extended) if extended.xattr_icount > 0 => {
                 let size = (extended.xattr_icount as usize - 1) * 4 + 12;
-
                 // WE skip the header bit from the data and take the rest
                 &inode_data[std::mem::size_of::<ExtendedInodeHeader>()..][..size]
             }
@@ -276,8 +340,6 @@ impl Inode {
         assert!(first_nameoff % 12 == 0);
         let num_dirents = (first_nameoff / 12) as usize;
 
-        println!("num_dirents: {num_dirents:?}");
-
         if num_dirents == 0 {
             println!("first: {first:?}");
             return vec![];
@@ -323,7 +385,13 @@ impl Inode {
         return dirents;
     }
 
-    pub fn dirents(&self, layout: InodeDataLayout, inode_data: &[u8]) -> Vec<MyDirEnt> {
+    pub fn parse_inode(
+        &self,
+        layout: InodeDataLayout,
+        inode_data: &[u8],
+        file: &[u8],
+        superblock: &Superblock,
+    ) -> Vec<MyDirEnt> {
         let header_size = match self {
             Inode::Compact(..) => std::mem::size_of::<CompactInodeHeader>(),
             Inode::Extended(..) => std::mem::size_of::<ExtendedInodeHeader>(),
@@ -331,28 +399,73 @@ impl Inode {
 
         use InodeDataLayout::*;
 
-        let data = match layout {
+        match layout {
             FlatPlain => {
-                println!("FlatPlain inode: {self:#?}");
+                let block_size = 1 << superblock.blkszbits;
 
-                let data = &inode_data[self.u() as usize..][..self.size() as usize];
+                // Data is stored at inode.u * block_size
+                // why is this not properly documented? idk...
+                let data = &file[self.u() as usize * block_size..][..block_size];
 
-                self.parse_dirents(&data)
+                if self.is_dir() {
+                    return self.parse_dirents(data);
+                }
+
+                self.get_xattrs(data);
             }
 
             CompressedFull => unimplemented!("CompressedFull"),
 
             // Data is stored right after the xattrs
             FlatInline => {
-                // TODO: Handle xattrs
                 let data = &inode_data[header_size..][..self.size() as usize];
-                self.parse_dirents(&data)
+
+                if self.is_dir() {
+                    return self.parse_dirents(&data);
+                }
+
+                self.get_xattrs(data);
             }
 
             CompressedCompact => unimplemented!("CompressedCompact"),
-            ChunkBased => unimplemented!("ChunkBased"),
+
+            ChunkBased => {
+                if !self.is_dir() {
+                    return vec![];
+                }
+
+                // the file’s data is not stored contiguously.
+                // Instead, it’s divided into chunks, and the inode holds a table of physical block mappings for each chunk.
+                //
+                // WE DON'T USE THIS
+
+                let block_size = 1 << superblock.blkszbits;
+
+                println!(
+                    "chunk: {:?}",
+                    &file[self.u() as usize * block_size..][..block_size]
+                );
+            }
         };
 
-        data
+        vec![]
+    }
+
+    pub fn get_xattrs<'a>(&self, data: &'a [u8]) -> Option<Xattrs<'a>> {
+        let xattrs = self.xattrs(data);
+
+        if xattrs.len() == 0 {
+            return None;
+        }
+
+        let header_size = std::mem::size_of::<XattrHeader>();
+
+        let header = &xattrs[..header_size];
+        let header = unsafe { std::ptr::read_unaligned(header.as_ptr() as *const XattrHeader) };
+
+        Some(Xattrs {
+            header,
+            data: &xattrs[header_size..],
+        })
     }
 }
