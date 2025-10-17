@@ -7,6 +7,7 @@ mod utils;
 
 use inode::*;
 use sb::*;
+use std::ptr;
 
 use anyhow::Result;
 
@@ -62,35 +63,54 @@ fn main() -> Result<()> {
 
     let sb_bytes: &[u8; 1024] = superblock.try_into().expect("slice must be 1024 bytes");
     let superblock: Superblock =
-        unsafe { std::ptr::read_unaligned(sb_bytes.as_ptr() as *const Superblock) };
+        unsafe { ptr::read_unaligned(sb_bytes.as_ptr() as *const Superblock) };
 
     let block_size = 1 << superblock.blkszbits;
 
     println!("superblock: {superblock:#?}");
     println!("block_size: {}", block_size);
 
-    let root_inode_start = get_inode_offset(&superblock, superblock.root_nid.into());
+    let mut nids = vec![superblock.root_nid as usize];
 
-    println!("root_inode_start: {}", root_inode_start);
+    while nids.len() > 0 {
+        let nid = nids[0];
+        nids = nids[1..].into();
 
-    let inode_first_byte = file[root_inode_start];
+        let inode_start = get_inode_offset(&superblock, nid);
 
-    let inode = if inode_first_byte & 1 == 1 {
-        // extended inode
-        let bytes = &file[root_inode_start..][..std::mem::size_of::<ExtendedInodeHeader>()];
-        let ext = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const ExtendedInodeHeader) };
+        let inode_first_byte = file[inode_start];
 
-        Inode::Extended(ext)
-    } else {
-        let bytes = &file[root_inode_start..][..std::mem::size_of::<CompactInodeHeader>()];
-        let cpt = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const CompactInodeHeader) };
+        let bytes = &file[inode_start..];
 
-        Inode::Compact(cpt)
-    };
+        let inode = if inode_first_byte & 1 == 1 {
+            // extended inode
+            let bytes = &bytes[..std::mem::size_of::<ExtendedInodeHeader>()];
+            let ext = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const ExtendedInodeHeader) };
 
-    println!("inode: {inode:#?}");
-    println!("is_dir: {}", inode.is_dir());
-    println!("xattrs: {:?}", inode.xattrs(&file[root_inode_start..]));
+            Inode::Extended(ext)
+        } else {
+            let bytes = &bytes[..std::mem::size_of::<CompactInodeHeader>()];
+            let cpt = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const CompactInodeHeader) };
+
+            Inode::Compact(cpt)
+        };
+
+        if !inode.is_dir() {
+            continue;
+        }
+
+        let dirents = inode.dirents(inode.data_layout()?, &file[inode_start..]);
+
+        println!("dirents: {dirents:#?}");
+
+        for dirent in dirents {
+            if dirent.name == "." || dirent.name == ".." {
+                continue;
+            }
+
+            nids.push(dirent.dirent.nid as usize);
+        }
+    }
 
     Ok(())
 }
