@@ -104,11 +104,6 @@ fn main() -> Result<()> {
 
         if !inode.is_dir() {
             let xattrs = inode.get_xattrs(&file[inode_start..]);
-            println!("xattrs: {:?}", xattrs);
-
-            if xattrs.is_some() {
-                break;
-            }
         }
 
         for dirent in dirents {

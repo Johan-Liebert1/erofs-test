@@ -1,9 +1,12 @@
 use std::{
     fmt::{Debug, Display},
+    ops::Range,
     usize,
 };
 
 use crate::sb::Superblock;
+
+use std::ptr::read_unaligned;
 
 const S_IFMT: u16 = 0o170000;
 const S_IFREG: u16 = 0o100000;
@@ -77,35 +80,64 @@ impl TryFrom<u8> for InodeDataLayout {
 }
 
 #[repr(C, packed)]
-pub struct XattrHeader {
+pub struct XattrHeaderWoShared {
     pub name_filter: u32, /* bit value 1 indicates not-present */
     pub shared_count: u8,
     pub reserved2: [u8; 7],
-    pub shared_xattrs: [u8; 4], /* shared xattr id array */
 }
 
-impl Display for XattrHeader {
+pub struct XattrHeader<'a> {
+    pub header: XattrHeaderWoShared,
+    pub shared_xattrs: &'a [u8],
+}
+
+#[derive(Debug)]
+#[repr(C, packed)]
+pub struct ErofsXattrEntry {
+    /// length of name
+    pub name_len: u8,
+    /// attribute name index
+    pub name_index: u8,
+    /// size of attribute value
+    pub value_size: u16,
+    // followed by e_name and e_value
+    // attribute name
+    // pub name: [u8],
+}
+
+#[repr(C)]
+pub struct OverlayMetacopy {
+    pub version: u8,
+    pub len: u8,
+    pub flags: u8,
+    pub digest_algo: u8,
+    pub digest: [u8],
+}
+
+impl<'a> Display for XattrHeader<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name_filter = self.name_filter;
+        let name_filter = self.header.name_filter;
         let shared_xattrs = self.shared_xattrs;
 
         f.debug_struct("Xattrs")
             .field("name_filter", &name_filter)
-            .field("shared_count", &self.shared_count)
-            .field("reserved2", &self.reserved2)
+            .field("shared_count", &self.header.shared_count)
+            .field("reserved2", &self.header.reserved2)
             .field("shared_xattrs", &shared_xattrs)
             .finish()
     }
 }
 
-impl Debug for XattrHeader {
+impl<'a> Debug for XattrHeader<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self)
     }
 }
 
 pub struct Xattrs<'a> {
-    pub header: XattrHeader,
+    pub header: XattrHeader<'a>,
+    /// Does not contain the header
+    /// Is basically outer_data[header_size..]
     pub data: &'a [u8],
 }
 
@@ -121,6 +153,71 @@ impl<'a> Display for Xattrs<'a> {
 impl<'a> Debug for Xattrs<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self)
+    }
+}
+
+pub struct XattrSingle {
+    name: String,
+    value: Box<Vec<u8>>,
+}
+
+impl Debug for XattrSingle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "\nXattrSingle {{")?;
+        writeln!(f, "\tname: {},", self.name)?;
+        writeln!(f, "\tvalue: {:?}", self.value)?;
+        write!(f, "}}")
+    }
+}
+
+impl<'a> Xattrs<'a> {
+    pub fn get_all_xattrs(&self) {
+        let sizeof_entry = size_of::<ErofsXattrEntry>();
+
+        let mut xattrs = vec![];
+
+        let mut data = self.data;
+
+        // TODO: Get all xattrs
+        loop {
+            if data.len() < sizeof_entry {
+                break;
+            }
+
+            let ent = &data[..sizeof_entry];
+            let ent = unsafe { read_unaligned(ent.as_ptr() as *const ErofsXattrEntry) };
+
+            let name_range = Range {
+                start: ent.name_index as usize,
+                end: (ent.name_index as usize + ent.name_len as usize) as usize,
+            };
+
+            if name_range.end >= data.len() {
+                break;
+            }
+
+            let name = String::from_utf8(data[name_range.clone()].to_vec()).unwrap();
+
+            let value_range = Range {
+                start: name_range.end,
+                end: name_range.end + ent.value_size as usize,
+            };
+
+            let value = &data[value_range.clone()];
+
+            xattrs.push(XattrSingle {
+                name,
+                value: Box::new(value.to_vec()),
+            });
+
+            data = &data[value_range.end..];
+        }
+
+        for attr in xattrs {
+            if attr.name == "overlay.redirect" {
+                println!("{}", String::from_utf8(*attr.value).unwrap());
+            }
+        }
     }
 }
 
@@ -264,13 +361,13 @@ impl Inode {
             Inode::Compact(compact) if compact.xattr_icount > 0 => {
                 let size = (compact.xattr_icount as usize - 1) * 4 + 12;
                 // WE skip the header bit from the data and take the rest
-                &inode_data[std::mem::size_of::<CompactInodeHeader>()..][..size]
+                &inode_data[size_of::<CompactInodeHeader>()..][..size]
             }
 
             Inode::Extended(extended) if extended.xattr_icount > 0 => {
                 let size = (extended.xattr_icount as usize - 1) * 4 + 12;
                 // WE skip the header bit from the data and take the rest
-                &inode_data[std::mem::size_of::<ExtendedInodeHeader>()..][..size]
+                &inode_data[size_of::<ExtendedInodeHeader>()..][..size]
             }
 
             _ => &[],
@@ -291,7 +388,7 @@ impl Inode {
 
     /// Returns the dirent at index `num`
     fn get_dirent(&self, inode_data: &[u8], num: usize) -> DirEnt {
-        let dirent_size = std::mem::size_of::<DirEnt>();
+        let dirent_size = size_of::<DirEnt>();
 
         let start = dirent_size * num;
         let end = start + dirent_size;
@@ -306,7 +403,7 @@ impl Inode {
 
         // NOTE: this works out with little endian as my machine is little endian
         // This would break spectacularly on a big endian machine
-        let dirent = unsafe { std::ptr::read_unaligned(dirent.as_ptr() as *const DirEnt) };
+        let dirent = unsafe { read_unaligned(dirent.as_ptr() as *const DirEnt) };
 
         dirent
     }
@@ -346,6 +443,13 @@ impl Inode {
         }
 
         loop {
+            if second.name_offset as usize > inode_data.len() {
+                println!("dirent_num: {dirent_num:#?}");
+                println!("first: {first:#?}");
+                println!("second: {second:#?}");
+                println!("inode_data: {inode_data:?}");
+            }
+
             let my_dirent = MyDirEnt {
                 dirent: first.clone(),
                 name: String::from_utf8(
@@ -393,8 +497,8 @@ impl Inode {
         superblock: &Superblock,
     ) -> Vec<MyDirEnt> {
         let header_size = match self {
-            Inode::Compact(..) => std::mem::size_of::<CompactInodeHeader>(),
-            Inode::Extended(..) => std::mem::size_of::<ExtendedInodeHeader>(),
+            Inode::Compact(..) => size_of::<CompactInodeHeader>(),
+            Inode::Extended(..) => size_of::<ExtendedInodeHeader>(),
         };
 
         use InodeDataLayout::*;
@@ -458,14 +562,24 @@ impl Inode {
             return None;
         }
 
-        let header_size = std::mem::size_of::<XattrHeader>();
+        let header_size = size_of::<XattrHeaderWoShared>();
 
         let header = &xattrs[..header_size];
-        let header = unsafe { std::ptr::read_unaligned(header.as_ptr() as *const XattrHeader) };
+        let header = unsafe { read_unaligned(header.as_ptr() as *const XattrHeaderWoShared) };
 
-        Some(Xattrs {
+        // TODO: Handle shared_count > 0
+        let header = XattrHeader {
+            shared_xattrs: if header.shared_count > 0 { &[] } else { &[] },
+            header,
+        };
+
+        let xattrs = Xattrs {
             header,
             data: &xattrs[header_size..],
-        })
+        };
+
+        xattrs.get_all_xattrs();
+
+        Some(xattrs)
     }
 }
